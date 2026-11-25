@@ -56,20 +56,30 @@ jobs:
           set -euo pipefail
           XCODE_VERSION="$(python -c 'import json; print(json.load(open("versions.json"))["xcode"])')"
           DEVELOPER_DIR=""
+          FALLBACK=""
           for app in /Applications/Xcode*.app; do
             candidate="$app/Contents/Developer"
             version="$("$candidate/usr/bin/xcodebuild" -version 2>/dev/null | head -1 | sed 's/^Xcode //')"
             echo "$app -> ${version:-unknown}"
-            if [[ "$version" == "$XCODE_VERSION" ]]; then
-              DEVELOPER_DIR="$candidate"
+            if [[ -n "$version" ]]; then
+              if [[ "$version" == "$XCODE_VERSION" ]]; then
+                DEVELOPER_DIR="$candidate"
+              fi
+              FALLBACK="$candidate"
             fi
           done
           if [[ -z "$DEVELOPER_DIR" ]]; then
-            echo "::error::Required Xcode ${XCODE_VERSION} is not installed on this runner. Select a runner with this version."
-            exit 1
+            echo "::warning::Xcode ${XCODE_VERSION} is not installed on this runner; using the newest available"
+            DEVELOPER_DIR="$FALLBACK"
           fi
+          [[ -n "$DEVELOPER_DIR" ]] || { echo "::error::No usable Xcode found"; exit 1; }
           sudo xcode-select --switch "$DEVELOPER_DIR"
           echo "DEVELOPER_DIR=$DEVELOPER_DIR" >> "$GITHUB_ENV"
+          ACTUAL="$(xcodebuild -version | head -1 | sed 's/^Xcode //')"
+          if [[ "$ACTUAL" != "$XCODE_VERSION" ]]; then
+            echo "::warning::Building with Xcode ${ACTUAL} instead of ${XCODE_VERSION}"
+            python -c "import json,sys; p='versions.json'; d=json.load(open(p)); d['xcode']=sys.argv[1]; json.dump(d, open(p,'w'), indent=4)" "$ACTUAL"
+          fi
           xcodebuild -version
           xcrun --sdk iphoneos --show-sdk-version
           df -h .
