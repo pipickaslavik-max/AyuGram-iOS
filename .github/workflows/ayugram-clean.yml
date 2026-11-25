@@ -1,0 +1,171 @@
+# Zero-egress AyuGram iOS build.
+# Copy this file to .github/workflows/ayugram-clean.yml in your fork, and copy
+# strip_telemetry.py to the repository root. Then: Actions -> "AyuGram iOS (clean)" -> Run workflow.
+#
+# Secrets required (Settings -> Secrets and variables -> Actions):
+#   TELEGRAM_API_ID, TELEGRAM_API_HASH  - from my.telegram.org
+#   APPLE_TEAM_ID                       - 10 characters, any valid team id
+#   APP_BUNDLE_ID                       - your bundle identifier
+# Optional variable: AYUGRAM_RUNNER     - runner label that has Xcode 27.1 installed
+name: AyuGram iOS (clean)
+
+on:
+  workflow_dispatch:
+    inputs:
+      variant:
+        description: 'Variant to build'
+        type: choice
+        options: [standard, custom]
+        default: standard
+      configuration:
+        description: 'Device build configuration'
+        type: choice
+        options: [release_arm64, debug_arm64]
+        default: release_arm64
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ${{ vars.AYUGRAM_RUNNER || 'macos-latest' }}
+    timeout-minutes: 360
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Checkout source with submodules
+        uses: actions/checkout@v6
+        with:
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.10'
+
+      - name: Strip telemetry (relay, stats, profile lookups, updates, AI relay)
+        run: python3 strip_telemetry.py .
+
+      - name: Check CI helpers
+        run: python -m unittest discover -s ci/tests -p 'test_*.py' -v
+
+      - name: Select the Xcode pinned in versions.json
+        run: |
+          set -euo pipefail
+          XCODE_VERSION="$(python -c 'import json; print(json.load(open("versions.json"))["xcode"])')"
+          DEVELOPER_DIR=""
+          for app in /Applications/Xcode*.app; do
+            candidate="$app/Contents/Developer"
+            version="$("$candidate/usr/bin/xcodebuild" -version 2>/dev/null | head -1 | sed 's/^Xcode //')"
+            echo "$app -> ${version:-unknown}"
+            if [[ "$version" == "$XCODE_VERSION" ]]; then
+              DEVELOPER_DIR="$candidate"
+            fi
+          done
+          if [[ -z "$DEVELOPER_DIR" ]]; then
+            echo "::error::Required Xcode ${XCODE_VERSION} is not installed on this runner. Select a runner with this version."
+            exit 1
+          fi
+          sudo xcode-select --switch "$DEVELOPER_DIR"
+          echo "DEVELOPER_DIR=$DEVELOPER_DIR" >> "$GITHUB_ENV"
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-version
+          df -h .
+
+      - name: Free disk space
+        run: |
+          set -uo pipefail
+          df -h /
+          KEEP="$(cd "${DEVELOPER_DIR%/Contents/Developer}" && pwd -P)"
+          [[ -n "$KEEP" && -x "$KEEP/Contents/Developer/usr/bin/xcodebuild" ]] || { echo "::error::Pinned Xcode not found"; exit 1; }
+          for app in /Applications/Xcode*.app; do
+            if [[ ! -L "$app" && "$(cd "$app" && pwd -P)" != "$KEEP" ]]; then
+              sudo rm -rf "$app" &
+            fi
+          done
+          xcrun simctl shutdown all 2>/dev/null || true
+          xcrun simctl delete all 2>/dev/null || true
+          xcrun simctl runtime delete all 2>/dev/null || true
+          sudo rm -rf ~/Library/Android /usr/local/share/dotnet ~/.dotnet ~/Library/Developer/CoreSimulator/Caches &
+          wait || true
+          df -h /
+
+      - name: Install the Metal toolchain
+        run: |
+          set -euo pipefail
+          if ! xcrun metal --version >/dev/null 2>&1; then
+            xcodebuild -downloadComponent MetalToolchain
+          fi
+          for attempt in $(seq 1 60); do
+            if xcrun metal --version; then
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "::error::The Metal toolchain did not become available"
+          exit 1
+
+      - name: Check build utilities
+        run: |
+          set -euo pipefail
+          if ! command -v ccache >/dev/null; then
+            brew install ccache
+          fi
+          ccache --version
+          node --version
+
+      - name: Restore Bazel cache
+        uses: actions/cache/restore@v5
+        with:
+          path: ~/telegram-bazel-cache
+          key: bazel-clean-${{ github.ref_name }}-${{ github.run_id }}
+          restore-keys: |
+            bazel-clean-${{ github.ref_name }}-
+            bazel-clean-
+
+      - name: Check and build
+        env:
+          AYUGRAM_BAZEL_CACHE: /Users/runner/telegram-bazel-cache
+          TELEGRAM_API_ID: ${{ secrets.TELEGRAM_API_ID }}
+          TELEGRAM_API_HASH: ${{ secrets.TELEGRAM_API_HASH }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APP_BUNDLE_ID: ${{ secrets.APP_BUNDLE_ID }}
+          AYUGRAM_VARIANT: ${{ inputs.variant }}
+          AYUGRAM_CONFIGURATION: ${{ inputs.configuration }}
+        run: python -u ci/ayugram_ci.py --source . --ci ci --output artifacts
+
+      - name: Save Bazel cache
+        if: ${{ always() }}
+        continue-on-error: true
+        uses: actions/cache/save@v5
+        with:
+          path: ~/telegram-bazel-cache
+          key: bazel-clean-${{ github.ref_name }}-${{ github.run_id }}
+
+      - name: Read build number
+        if: ${{ always() }}
+        id: manifest
+        run: |
+          if [[ -f artifacts/build-manifest.json ]]; then
+            BUILD_NUMBER="$(python -c 'import json; print(json.load(open("artifacts/build-manifest.json"))["build_number"])')"
+          else
+            BUILD_NUMBER="$GITHUB_RUN_NUMBER"
+          fi
+          echo "build_number=$BUILD_NUMBER" >> "$GITHUB_OUTPUT"
+
+      - name: Save build artifact
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v6
+        with:
+          name: ayugram-clean-${{ inputs.variant }}-${{ steps.manifest.outputs.build_number }}
+          path: |
+            artifacts/*.ipa
+            artifacts/build-manifest.json
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Remove generated credential files
+        if: ${{ always() }}
+        run: python ci/ayugram_ci.py --source . --cleanup-only
